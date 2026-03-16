@@ -53,7 +53,7 @@ class WebRTCSyncPusher(FrameProcessor):
         self.playback_queue = collections.deque()
         self.generation_queue = asyncio.Queue()
         
-        idle_img = cv2.imread("examples/girl.png")
+        idle_img = cv2.imread("examples/omani_character.png")
         if idle_img is None:
             idle_img = np.zeros((512, 512, 3), dtype=np.uint8)
         else:
@@ -159,6 +159,11 @@ class WebRTCSyncPusher(FrameProcessor):
             start_time = time.time()
             
             try:
+                if len(self.playback_queue) > 50:
+                    logger.warning(f"Playback queue too large ({len(self.playback_queue)}). Catching up to real-time...")
+                    while len(self.playback_queue) > 25:
+                        self.playback_queue.popleft()
+                        
                 if len(self.playback_queue) > 0:
                     rgba, audio_bytes = self.playback_queue.popleft()
                     
@@ -173,15 +178,8 @@ class WebRTCSyncPusher(FrameProcessor):
                     )
                     await self.audio_source.capture_frame(af)
                 else:
-                    vf = rtc.VideoFrame(self.idle_rgba.shape[1], self.idle_rgba.shape[0], rtc.VideoBufferType.RGBA, self.idle_rgba.tobytes())
-                    self.video_source.capture_frame(vf)
-                    af = rtc.AudioFrame(
-                        data=np.zeros(int(self.sample_rate // self.tgt_fps), dtype=np.int16).tobytes(),
-                        sample_rate=self.sample_rate,
-                        num_channels=1,
-                        samples_per_channel=int(self.sample_rate // self.tgt_fps)
-                    )
-                    await self.audio_source.capture_frame(af)
+                    await asyncio.sleep(0.01)
+                    continue
                     
             except Exception as e:
                 logger.error(f"Error playing back frame: {e}")
@@ -211,7 +209,9 @@ async def main():
                 audio_in_enabled=True,
                 audio_out_enabled=False, 
                 video_out_enabled=False, 
-                vad_enabled=False
+                vad_enabled=False,
+                audio_in_sample_rate=16000,
+                audio_out_sample_rate=16000
             )
         )
         
@@ -223,7 +223,7 @@ async def main():
             model_type="lite"
         )
         
-        get_base_data(model_pipeline, cond_image_path_or_dir="examples/girl.png", base_seed=42, use_face_crop=False)
+        get_base_data(model_pipeline, cond_image_path_or_dir="examples/omani_character.png", base_seed=42, use_face_crop=False)
         
         logger.info("Pre-warming the GPU to build CUDA graphs. This will take ~30-40 seconds...")
         infer_params = get_infer_params()
