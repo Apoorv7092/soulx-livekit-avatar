@@ -15,7 +15,7 @@ Here is our current progress toward building a sub-700ms diffusion video system:
 - ✅ **Sub-1.5s Rendering:** Optimized A100 Lite model inference (~5x faster than real-time playback).
 - ✅ **Dynamic Animation:** Exposed CFG scaling for live facial intensity tweaks (Zero latency cost).
 - ✅ **LightX2V Autoencoder:** Integrated distilled VAE (Decode time reduced ~35ms/chunk; VRAM footprint reduced by ~9.6GB).
-- ⏳ **Release LightX2V Integration:** Upload VAE integration code and optimized model config files to public repo.
+- ✅ **Release LightX2V Integration:** Upload VAE integration code and optimized model config files to public repo.
 - ⏳ **Temporal Window Shrinking:** Reduce batch size from 32 to 8 frames (~960ms minimum audio context latency reduction).
 - ⏳ **Continuous Frame Yielding:** Yield RGB frames sequentially during decode (~150ms perceived latency reduction).
 - ⏳ **TensorRT Compilation:** Compile PyTorch graph to NVIDIA TensorRT (Expected latency reduction: ~150ms).

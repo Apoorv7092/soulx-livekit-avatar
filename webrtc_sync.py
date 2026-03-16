@@ -82,6 +82,12 @@ class WebRTCSyncPusher(FrameProcessor):
                 def run_infer():
                     torch.cuda.synchronize()
                     audio_embedding = get_audio_embedding(self.model_pipeline, audio_array, self.audio_start_idx, self.audio_end_idx)
+                    
+                    # DYNAMIC ANIMATION MULTIPLIER
+                    # Increase this to > 1.0 for more dramatic mouth/head movements
+                    animation_multiplier = 1.5 
+                    audio_embedding = audio_embedding * animation_multiplier
+                    
                     video = run_pipeline(self.model_pipeline, audio_embedding)
                     torch.cuda.synchronize()
                     return video.cpu().numpy()
@@ -178,7 +184,9 @@ class WebRTCSyncPusher(FrameProcessor):
                     )
                     await self.audio_source.capture_frame(af)
                 else:
-                    await asyncio.sleep(0.01)
+                    vf = rtc.VideoFrame(self.idle_rgba.shape[1], self.idle_rgba.shape[0], rtc.VideoBufferType.RGBA, self.idle_rgba.tobytes())
+                    self.video_source.capture_frame(vf)
+                    await asyncio.sleep(0.04)
                     continue
                     
             except Exception as e:
