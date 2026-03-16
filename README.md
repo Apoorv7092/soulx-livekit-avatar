@@ -10,20 +10,20 @@ Our ultimate goal is to achieve a full end-to-end conversational latency (includ
 
 Here is our current progress toward building a sub-700ms diffusion video system:
 
-✅ **Continuous Streaming:** Built idle/active WebRTC stream handler (100% uptime improvement).
-✅ **JIT Pre-Warming:** Bypassed PyTorch graph compilation delays (~120,000ms latency reduction on boot).
-✅ **Sub-1.5s Rendering:** Optimized A100 Lite model inference (~5x faster than real-time playback).
-✅ **Dynamic Animation:** Exposed CFG scaling for live facial intensity tweaks (Zero latency cost).
-✅ **LightX2V Autoencoder:** Integrated distilled VAE (Decode time reduced ~35ms/chunk; VRAM footprint reduced by ~9.6GB).
-⏳ **Release LightX2V Integration:** Upload VAE integration code and optimized model config files to public repo.
-✅ **Temporal Window Shrinking:** Reduced batch size from 32 to 8 frames (~960ms minimum audio context latency reduction).
-⏳ **Release Dynamic Chunk-Sizing:** Publish dynamic chunk-sizing code and updated inference scripts.
-✅ **Continuous Frame Yielding:** Yield RGB frames sequentially during decode (~150ms perceived latency reduction).
-⏳ **Release Staggered Yielding:** Push staggered WebRTC yielding implementation.
-⏳ **TensorRT Compilation:** Compile PyTorch graph to NVIDIA TensorRT (Expected latency reduction: ~150ms).
-⏳ **Wav2Vec2 Concurrency:** Asynchronous micro-chunking for audio extraction (Expected latency reduction: ~30ms).
-⏳ **FP8/INT8 Quantization:** Quantize model weights via `bitsandbytes` (Expected rendering speedup: ~30%).
-⏳ **Full Autonomous Agent:** Pipe Deepgram ASR -> OpenAI LLM -> ElevenLabs TTS directly into transport.
+- ✅ **Continuous Streaming:** Built idle/active WebRTC stream handler (100% uptime improvement).
+- ✅ **JIT Pre-Warming:** Bypassed PyTorch graph compilation delays (~120,000ms latency reduction on boot).
+- ✅ **Sub-1.5s Rendering:** Optimized A100 Lite model inference (~5x faster than real-time playback).
+- ✅ **Dynamic Animation:** Exposed CFG scaling for live facial intensity tweaks (Zero latency cost).
+- ✅ **LightX2V Autoencoder:** Integrated distilled VAE (Decode time reduced ~35ms/chunk; VRAM footprint reduced by ~9.6GB).
+- ⏳ **Release LightX2V Integration:** Upload VAE integration code and optimized model config files to public repo.
+- ✅ **Temporal Window Shrinking:** Reduced batch size from 32 to 8 frames (~960ms minimum audio context latency reduction).
+- ⏳ **Release Dynamic Chunk-Sizing:** Publish dynamic chunk-sizing code and updated inference scripts.
+- ✅ **Continuous Frame Yielding:** Yield RGB frames sequentially during decode (~150ms perceived latency reduction).
+- ⏳ **Release Staggered Yielding:** Push staggered WebRTC yielding implementation.
+- ⏳ **TensorRT Compilation:** Compile PyTorch graph to NVIDIA TensorRT (Expected latency reduction: ~150ms).
+- ⏳ **Wav2Vec2 Concurrency:** Asynchronous micro-chunking for audio extraction (Expected latency reduction: ~30ms).
+- ⏳ **FP8/INT8 Quantization:** Quantize model weights via `bitsandbytes` (Expected rendering speedup: ~30%).
+- ⏳ **Full Autonomous Agent:** Pipe Deepgram ASR -> OpenAI LLM -> ElevenLabs TTS directly into transport.
 
 ## 🛠 Prerequisites & Setup
 
