@@ -251,7 +251,7 @@ async def main():
             pusher
         ])
 
-        task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=False), cancel_on_idle_timeout=False)
+        task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=False), idle_timeout_secs=None)
         
         runner = PipelineRunner()
         
