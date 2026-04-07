@@ -39,11 +39,35 @@ Required env vars (.env in same directory):
   WAV2VEC_DIR                         (default: models/hindi_base_wav2vec2)
 
 New / dev-only env vars:
-  TTS_PROVIDER          "ori" (default) | "elevenlabs"
+  TTS_PROVIDER          "ori" (default) | "elevenlabs" | "sarvam"
+
+  # Ori TTS
+  ORI_TTS_ENCODING      "pcm_16000" (default) | "mp3_24000_48"
+                        pcm_16000  → raw S16LE at 16 kHz (lowest latency, no decode)
+                        mp3_24000_48 → MP3 at 24 kHz / 48 kbps, decoded + resampled
+                                       to 16 kHz via pydub (pip install pydub; needs ffmpeg)
+
+  # ElevenLabs
   ELEVENLABS_API_KEY    ElevenLabs API key (required when TTS_PROVIDER=elevenlabs)
   ELEVENLABS_VOICE_ID   ElevenLabs voice ID
   ELEVENLABS_MODEL_ID   Model to use (default: eleven_flash_v2_5)
+
+  # Sarvam
+  SARVAM_API_KEY        Sarvam API subscription key (required when TTS_PROVIDER=sarvam)
+  SARVAM_SPEAKER        Speaker voice (default: anushka)
+                        bulbul:v2 voices: anushka, abhilash, manisha, vidya, arya, karun, hitesh
+                        bulbul:v3 voices: aditya, ritu, priya, neha, rahul, pooja, ...
+  SARVAM_LANGUAGE       BCP-47 language code (default: hi-IN)
+                        Supported: hi-IN, en-IN, bn-IN, gu-IN, kn-IN, ml-IN,
+                                   mr-IN, od-IN, pa-IN, ta-IN, te-IN
+  SARVAM_MODEL          "bulbul:v2" (default) | "bulbul:v3"
+
   IDLE_VIDEO            Path to head-motion MP4 for idle state (optional)
+  VIDEO_STREAM_GEN      "true" (default) | "false"
+                        true  → streaming: each TTS chunk inferred as it arrives (low latency)
+                        false → full-shot: all TTS audio collected first, single audio encoding,
+                                then all chunks inferred before any frames are played (higher
+                                quality / no chunk boundary glitches, but higher latency)
 """
 
 import asyncio
@@ -78,6 +102,32 @@ from flash_head.inference import (
 
 load_dotenv(override=True)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MP3 → PCM helper  (used by OriTTSClient when encoding=mp3_24000_48)
+# ─────────────────────────────────────────────────────────────────────────────
+def _mp3_to_pcm16k(mp3_bytes: bytes) -> bytes:
+    """Decode a complete MP3 blob to mono 16-bit PCM at SAMPLE_RATE (16 kHz).
+
+    Requires pydub + ffmpeg:
+        pip install pydub
+        apt-get install ffmpeg   # or brew install ffmpeg
+    """
+    try:
+        from pydub import AudioSegment  # lazy import — only needed for mp3 path
+    except ImportError:
+        raise RuntimeError(
+            "pydub is required for ORI_TTS_ENCODING=mp3_24000_48: pip install pydub"
+        )
+    seg = (
+        AudioSegment.from_mp3(io.BytesIO(mp3_bytes))
+        .set_channels(1)         # mono
+        .set_sample_width(2)     # 16-bit
+        .set_frame_rate(16_000)  # resample to 16 kHz
+    )
+    return seg.raw_data
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants / tunables
 # ─────────────────────────────────────────────────────────────────────────────
@@ -99,8 +149,20 @@ TTS_CHUNK_BYTES = SAMPLE_RATE * 2   # 1-second chunks fed to FlashHead
 
 ANIMATION_MULTIPLIER = 1.5
 PLAYBACK_QUEUE_MAX   = 999
+TTS_MIN_WORDS        = 5    # minimum word count before a TTS chunk is dispatched
+                             # during LLM streaming; end-of-stream flushes regardless
 
-SYSTEM_PROMPT = """You are a helpful voiceAI named ALI who speaks in eng. If the user speaks in hindi roman-scripture, you always reply in hindi devanagri script only. Strictly refrain from responding in hindi latin scripts like "kya", "aap" "mein" etc. ONLY RESPLY IN DEVANAGRI IF THE USER IS SPEAKING IN HINDI ROMANIZED ELSE IN ENGLISH NO TRANSLITERATED RESPONSES FROM YOUR SIDE OR YOU WILL BE FIRED FROM YOUR JOB. strictly no emojis as this is a voice conversation. STRICTLY REFRAIN FROM GENERATING Exclaimation marks, only generate full stop as a sentence ender, not even comma."""
+# VIDEO_STREAM_GEN=true  (default) — streaming: each TTS chunk → inference → playback
+# VIDEO_STREAM_GEN=false           — full-shot: collect all TTS audio first, then run
+#                                    a single get_audio_embedding over the whole response,
+#                                    split into chunks, infer all, then push to playback
+VIDEO_STREAM_GEN = os.getenv("VIDEO_STREAM_GEN", "true").lower() not in ("0", "false", "no")
+
+# Fallback system prompt used when SYSTEM_PROMPT_FILE env var is not set.
+_DEFAULT_SYSTEM_PROMPT = """You are a helpful voiceAI named ALI who speaks in eng. If the user speaks in hindi roman-scripture, you always reply in hindi devanagri script only. Strictly refrain from responding in hindi latin scripts like "kya", "aap" "mein" etc. ONLY RESPLY IN DEVANAGRI IF THE USER IS SPEAKING IN HINDI ROMANIZED ELSE IN ENGLISH NO TRANSLITERATED RESPONSES FROM YOUR SIDE OR YOU WILL BE FIRED FROM YOUR JOB. strictly no emojis as this is a voice conversation. STRICTLY REFRAIN FROM GENERATING Exclaimation marks, only generate full stop as a sentence ender, not even comma."""
+
+# Fallback greeting used when GREETING_TEXT env var is not set.
+_DEFAULT_GREETING = "Greet the user warmly and briefly in English, then ask sarcastically(strictly no emojis)"
 _SENTENCE_END = re.compile(r'(?<=[.!?,;])\s+')
 
 # Max idle video frames cached in RAM (~20s at 30fps = 600 frames).
@@ -192,25 +254,45 @@ class STTClient:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TTS client — Ori TTS WebSocket (unchanged from stable)
+# TTS client — Ori TTS WebSocket
 # ─────────────────────────────────────────────────────────────────────────────
 class OriTTSClient:
-    """Sends text to Ori TTS and yields PCM bytes as they arrive.
+    """Sends text to Ori TTS and yields raw PCM-16 bytes at 16 kHz.
 
-    Kept identical to stable TTSClient; renamed to OriTTSClient to coexist
-    with ElevenLabsTTSClient under a unified interface.
+    Supports two encodings selected via ORI_TTS_ENCODING env var:
+
+      pcm_16000    (default) — server streams raw S16LE PCM at 16 kHz.
+                               Lowest latency; chunks yielded as they arrive.
+
+      mp3_24000_48           — server streams MP3 at 24 kHz / 48 kbps.
+                               All chunks are buffered per sentence, decoded
+                               via pydub, and resampled to 16 kHz before
+                               yielding.  Requires: pip install pydub + ffmpeg.
     """
 
     def __init__(self, api_key: str, ws_url: str, voice_id: str,
-                 language: str = "hi"):
-        self._api_key  = api_key
-        self._ws_url   = ws_url
-        self._voice_id = voice_id
-        self._language = language
-        self._ws       = None
+                 language: str = "hi", encoding: str = "pcm_16000"):
+        self._api_key          = api_key
+        self._ws_url           = ws_url
+        self._voice_id         = voice_id
+        self._language         = language
+        self._encoding         = encoding
+        self._is_mp3           = encoding.startswith("mp3_")
+        self._ws               = None
+        self._utterance_req_id: str | None = None  # shared ID for request stitching
+
+    def begin_utterance(self):
+        """Generate a fresh speechReqId shared across all synthesize() calls
+        in this utterance, enabling Ori TTS request stitching for natural prosody."""
+        self._utterance_req_id = str(uuid.uuid4())
+        logger.debug(f"Ori TTS stitching started  speechReqId={self._utterance_req_id}")
+
+    def end_utterance(self):
+        """Clear the shared speechReqId — next synthesize() call will be standalone."""
+        self._utterance_req_id = None
 
     async def connect(self):
-        logger.info(f"Ori TTS connecting to {self._ws_url}")
+        logger.info(f"Ori TTS connecting to {self._ws_url}  (encoding={self._encoding})")
         self._ws = await websockets.connect(
             self._ws_url,
             additional_headers={"Authorization": f"Bearer {self._api_key}"},
@@ -227,24 +309,59 @@ class OriTTSClient:
         self._ws = None
 
     async def synthesize(self, text: str):
-        """Send `text`; async-yield decoded PCM bytes per chunk."""
+        """Send `text`; async-yield raw PCM-16 bytes at 16 kHz.
+
+        PCM path  : chunks yielded incrementally as they arrive from the server.
+        MP3 path  : chunks buffered for the whole sentence, decoded once
+                    complete, then yielded in TTS_CHUNK_BYTES sized pieces.
+        """
         if not self._ws or not text.strip():
             return
 
+        # Use shared speechReqId + stitch_request=True when inside an utterance
+        # (begin_utterance() was called), so Ori TTS maintains consistent prosody
+        # across all sentence chunks of the same bot response.
+        stitching = self._utterance_req_id is not None
         req = {
-            "text":        text,
-            "language":    self._language,
-            "voice_id":    self._voice_id,
-            "encoding":    TTS_ENCODING,
-            "speechReqId": str(uuid.uuid4()),
+            "text":           text,
+            "language":       self._language,
+            "voice_id":       self._voice_id,
+            "encoding":       self._encoding,
+            "speechReqId":    self._utterance_req_id or str(uuid.uuid4()),
+            "stitch_request": stitching,
         }
-        logger.debug(f"Ori TTS synthesize: {text!r}")
+        logger.debug(
+            f"Ori TTS synthesize ({self._encoding}, stitch={stitching}, "
+            f"reqId={req['speechReqId'][:8]}…): {text!r}"
+        )
         try:
             await self._ws.send(json.dumps(req))
         except Exception as e:
             logger.error(f"Ori TTS send error: {e}")
             return
 
+        # ── PCM path — stream chunks directly ────────────────────────────────
+        if not self._is_mp3:
+            try:
+                async for raw in self._ws:
+                    msg      = json.loads(raw)
+                    chunks   = msg.get("audio_chunks", [])
+                    complete = msg.get("audio_streaming_complete", False)
+
+                    for b64 in chunks:
+                        audio = base64.b64decode(b64)
+                        if len(audio) == 4092:   # skip non-audio metadata packets
+                            continue
+                        yield audio
+
+                    if complete:
+                        break
+            except Exception as e:
+                logger.error(f"Ori TTS recv error: {e}")
+            return
+
+        # ── MP3 path — buffer full sentence, decode once, yield as PCM ───────
+        mp3_chunks: list[bytes] = []
         try:
             async for raw in self._ws:
                 msg      = json.loads(raw)
@@ -252,16 +369,29 @@ class OriTTSClient:
                 complete = msg.get("audio_streaming_complete", False)
 
                 for b64 in chunks:
-                    audio = base64.b64decode(b64)
-                    # Skip 4092-byte non-audio metadata packets
-                    if len(audio) == 4092:
+                    data = base64.b64decode(b64)
+                    if len(data) == 4092:        # skip metadata
                         continue
-                    yield audio
+                    mp3_chunks.append(data)
 
                 if complete:
                     break
         except Exception as e:
-            logger.error(f"Ori TTS recv error: {e}")
+            logger.error(f"Ori TTS recv error (mp3): {e}")
+            return
+
+        if not mp3_chunks:
+            return
+
+        # Decode full MP3 blob → PCM-16 at 16 kHz, then yield in chunks
+        try:
+            pcm = _mp3_to_pcm16k(b"".join(mp3_chunks))
+        except Exception as e:
+            logger.error(f"Ori TTS MP3 decode error: {e}")
+            return
+
+        for i in range(0, len(pcm), TTS_CHUNK_BYTES):
+            yield pcm[i : i + TTS_CHUNK_BYTES]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -334,6 +464,9 @@ class ElevenLabsTTSClient:
 
     # ── public interface (same as OriTTSClient) ───────────────────────────────
 
+    def begin_utterance(self): pass   # no-op — ElevenLabs has no stitching API
+    def end_utterance(self):   pass
+
     async def connect(self):
         self._ws = await self._open_ws()
 
@@ -385,6 +518,143 @@ class ElevenLabsTTSClient:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TTS client — Sarvam TTS WebSocket  (NEW)
+# ─────────────────────────────────────────────────────────────────────────────
+class SarvamTTSClient:
+    """Streams text to Sarvam bulbul TTS and yields raw PCM-16 bytes at 16 kHz.
+
+    Uses linear16 output codec at 16 kHz so decoded bytes feed directly into
+    the FlashHead pipeline with zero resampling overhead.
+
+    Protocol:
+      1. connect()  — open WS + send required config handshake
+      2. synthesize(text) per sentence:
+             send {"type":"text", "data":{"text":"..."}}
+             send {"type":"flush"}
+             receive {"type":"audio"} chunks → yield decoded PCM bytes
+             break on {"type":"event", "data":{"event_type":"final"}}
+      3. disconnect() — close WS
+
+    Env vars:
+      SARVAM_API_KEY   — Api-Subscription-Key header value
+      SARVAM_SPEAKER   — voice name (default: anushka)
+      SARVAM_LANGUAGE  — BCP-47 code  (default: hi-IN)
+      SARVAM_MODEL     — bulbul:v2 | bulbul:v3  (default: bulbul:v2)
+    """
+
+    _WS_URL = "wss://api.sarvam.ai/text-to-speech/ws?send_completion_event=true"
+
+    def __init__(self, api_key: str, speaker: str = "anushka",
+                 language: str = "hi-IN", model: str = "bulbul:v2"):
+        self._api_key  = api_key
+        self._speaker  = speaker
+        self._language = language
+        self._model    = model
+        self._ws       = None
+
+    # ── internal ──────────────────────────────────────────────────────────────
+
+    def _config_payload(self) -> str:
+        """Build the required first-message config JSON.
+
+        bulbul:v2 — supports pitch/loudness; enable_preprocessing optional (default off)
+        bulbul:v3 — preprocessing always on (cannot be set False, omit the field);
+                    supports temperature instead of pitch/loudness
+        """
+        data: dict = {
+            "target_language_code": self._language,
+            "speaker":              self._speaker,
+            "model":                self._model,
+            "output_audio_codec":   "linear16",   # raw S16LE PCM, no decode step
+            "speech_sample_rate":   SAMPLE_RATE,  # 16000 Hz
+            "pace":                 1.0,
+        }
+
+        if self._model == "bulbul:v2":
+            # v2: preprocessing is optional, default off — keep it off for speed
+            data["enable_preprocessing"] = False
+        # v3: preprocessing is always on — do NOT send the field at all
+
+        return json.dumps({"type": "config", "data": data})
+
+    async def _open_ws(self):
+        logger.info(f"Sarvam TTS connecting… (speaker={self._speaker}, lang={self._language})")
+        ws = await websockets.connect(
+            self._WS_URL,
+            additional_headers={"Api-Subscription-Key": self._api_key},
+            max_size=16 * 1024 * 1024,
+        )
+        await ws.send(self._config_payload())   # required handshake — must be first message
+        logger.info("Sarvam TTS connected.")
+        return ws
+
+    async def _ensure_connected(self):
+        if self._ws is None or self._ws.closed:
+            logger.warning("Sarvam TTS WS closed — reconnecting…")
+            self._ws = await self._open_ws()
+
+    # ── public interface ──────────────────────────────────────────────────────
+
+    def begin_utterance(self): pass   # no-op — Sarvam has no stitching API
+    def end_utterance(self):   pass
+
+    async def connect(self):
+        self._ws = await self._open_ws()
+
+    async def disconnect(self):
+        if self._ws:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+        self._ws = None
+
+    async def synthesize(self, text: str):
+        """Send one sentence; async-yield raw PCM-16 bytes at 16 kHz."""
+        if not text.strip():
+            return
+
+        await self._ensure_connected()
+
+        logger.debug(f"Sarvam TTS synthesize: {text!r}")
+        try:
+            await self._ws.send(json.dumps({"type": "text", "data": {"text": text}}))
+            await self._ws.send(json.dumps({"type": "flush"}))
+        except Exception as e:
+            logger.error(f"Sarvam TTS send error: {e} — reconnecting")
+            self._ws = None
+            await self._ensure_connected()
+            await self._ws.send(json.dumps({"type": "text", "data": {"text": text}}))
+            await self._ws.send(json.dumps({"type": "flush"}))
+
+        try:
+            async for raw in self._ws:
+                msg      = json.loads(raw)
+                msg_type = msg.get("type")
+
+                if msg_type == "audio":
+                    b64 = msg.get("data", {}).get("audio", "")
+                    if b64:
+                        # linear16 → raw S16LE PCM at SAMPLE_RATE, no further processing
+                        yield base64.b64decode(b64)
+
+                elif msg_type == "event":
+                    if msg.get("data", {}).get("event_type") == "final":
+                        break
+
+                elif msg_type == "error":
+                    logger.error(
+                        f"Sarvam TTS server error: {msg.get('data', {}).get('message')}"
+                    )
+                    self._ws = None
+                    break
+
+        except Exception as e:
+            logger.error(f"Sarvam TTS recv error: {e}")
+            self._ws = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Avatar bot — ties everything together
 # ─────────────────────────────────────────────────────────────────────────────
 class AvatarBot:
@@ -400,6 +670,18 @@ class AvatarBot:
         self.stt_lang = os.getenv("ORI_STT_LANGUAGE", "en")
 
         self.tts_provider = os.getenv("TTS_PROVIDER", "ori").lower()
+
+        # ── System prompt — file takes priority over default ──────────────────
+        prompt_file = os.getenv("SYSTEM_PROMPT_FILE", "").strip()
+        if prompt_file:
+            with open(prompt_file, "r", encoding="utf-8") as _f:
+                self.system_prompt = _f.read().strip()
+            logger.info(f"System prompt loaded from {prompt_file!r}")
+        else:
+            self.system_prompt = _DEFAULT_SYSTEM_PROMPT
+
+        # ── Greeting text ─────────────────────────────────────────────────────
+        self.greeting_text = os.getenv("GREETING_TEXT", _DEFAULT_GREETING).strip()
 
         self.openai_key     = os.environ["OPENAI_API_KEY"]
         self.avatar_img     = os.getenv("AVATAR_IMAGE",   "examples/girl2.png")
@@ -418,13 +700,25 @@ class AvatarBot:
             el_model    = os.getenv("ELEVENLABS_MODEL_ID", "eleven_flash_v2_5")
             self.tts    = ElevenLabsTTSClient(el_key, el_voice, el_model)
             logger.info(f"TTS provider: ElevenLabs (model={el_model}, voice={el_voice})")
-        else:
-            tts_key     = os.environ["ORI_TTS_API_KEY"]
-            tts_ws_url  = os.environ["ORI_TTS_WS_URL"]
-            tts_voice   = os.environ["ORI_TTS_VOICE_ID"]
-            tts_lang    = os.getenv("ORI_TTS_LANGUAGE", "hi")
-            self.tts    = OriTTSClient(tts_key, tts_ws_url, tts_voice, tts_lang)
-            logger.info("TTS provider: Ori TTS")
+
+        elif self.tts_provider == "sarvam":
+            sv_key      = os.environ["SARVAM_API_KEY"]
+            sv_speaker  = os.getenv("SARVAM_SPEAKER",  "anushka")
+            sv_lang     = os.getenv("SARVAM_LANGUAGE", "hi-IN")
+            sv_model    = os.getenv("SARVAM_MODEL",    "bulbul:v2")
+            self.tts    = SarvamTTSClient(sv_key, sv_speaker, sv_lang, sv_model)
+            logger.info(
+                f"TTS provider: Sarvam (model={sv_model}, speaker={sv_speaker}, lang={sv_lang})"
+            )
+
+        else:  # "ori" (default)
+            tts_key      = os.environ["ORI_TTS_API_KEY"]
+            tts_ws_url   = os.environ["ORI_TTS_WS_URL"]
+            tts_voice    = os.environ["ORI_TTS_VOICE_ID"]
+            tts_lang     = os.getenv("ORI_TTS_LANGUAGE",  "hi")
+            tts_encoding = os.getenv("ORI_TTS_ENCODING",  "pcm_16000")
+            self.tts     = OriTTSClient(tts_key, tts_ws_url, tts_voice, tts_lang, tts_encoding)
+            logger.info(f"TTS provider: Ori TTS (encoding={tts_encoding})")
 
         # ── STT ───────────────────────────────────────────────────────────────
         self.stt = STTClient(self.stt_key, self.stt_url, self.stt_lang)
@@ -488,6 +782,16 @@ class AvatarBot:
         self._vad = SileroVAD(threshold=VAD_THRESHOLD)
 
         self.model_pipeline = None
+
+        # ── Testing mode — save each response's video frames to a UUID MP4 ───
+        self.is_testing_mode = os.getenv("TESTING_MODE", "false").lower() in ("1", "true", "yes")
+        self._test_writer: cv2.VideoWriter | None = None
+        self._test_writer_path: str = ""
+        self._test_audio_writer: wave.Wave_write | None = None
+        self._test_audio_path: str = ""
+        if self.is_testing_mode:
+            os.makedirs("debug_frames", exist_ok=True)
+            logger.info("Testing mode ON — video+audio will be saved to debug_frames/")
 
     # ──────────────────────────────────────────────────────────────────────────
     # Idle video helpers  (NEW: feature #2)
@@ -569,8 +873,16 @@ class AvatarBot:
                     audio_slice = chunk_bytes[i * bpf : (i + 1) * bpf]
                     self.playback_queue.append((rgba, audio_slice))
 
+                    if self.is_testing_mode and self._test_writer is not None:
+                        bgr = cv2.cvtColor(vf, cv2.COLOR_RGB2BGR)
+                        self._test_writer.write(bgr)
+                        if self._test_audio_writer is not None and audio_slice:
+                            self._test_audio_writer.writeframes(audio_slice)
+
             except Exception as e:
                 logger.error(f"Inference error: {e}")
+            finally:
+                self.generation_queue.task_done()
 
     # ──────────────────────────────────────────────────────────────────────────
     # Playback background task — publishes A/V to LiveKit at tgt_fps
@@ -659,6 +971,177 @@ class AvatarBot:
         await self._feed_tts_audio(tts_audio_buf, float_buf, b"")
 
     # ──────────────────────────────────────────────────────────────────────────
+    # Full-shot (non-streaming) inference — VIDEO_STREAM_GEN=false
+    # Collects all TTS PCM for the whole response, then encodes audio once and
+    # runs inference chunk-by-chunk (mirrors the 'once' mode in the reference
+    # generate.py script), then floods playback_queue with all frames at once.
+    # ──────────────────────────────────────────────────────────────────────────
+    async def _respond_nonstream(self, transcript: str):
+        if not transcript.strip():
+            return
+
+        logger.info(f"[NONSTREAM] User: {transcript!r}")
+        self._bot_speaking = True
+
+        if self.is_testing_mode:
+            _uid = str(uuid.uuid4())
+            self._test_writer_path = os.path.join("debug_frames", f"{_uid}.mp4")
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            self._test_writer = cv2.VideoWriter(
+                self._test_writer_path, fourcc, float(self.tgt_fps), (512, 512)
+            )
+            self._test_audio_path = os.path.join("debug_frames", f"{_uid}.wav")
+            _wf = wave.open(self._test_audio_path, "wb")
+            _wf.setnchannels(1)
+            _wf.setsampwidth(2)
+            _wf.setframerate(self.sr)
+            self._test_audio_writer = _wf
+            logger.info(f"[TEST] Recording to {self._test_writer_path!r} + {self._test_audio_path!r}")
+
+        self.conversation.append({"role": "user", "content": transcript})
+        full_response = ""
+
+        try:
+            # ── Step 1: LLM → full text, then TTS → collect all PCM ──────────
+            stream = await self.openai.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "system", "content": self.system_prompt}] + self.conversation,
+                stream=True,
+                temperature=0.7,
+            )
+
+            sentence_buf = ""
+            tts_pending  = ""
+            all_pcm      = bytearray()
+
+            self.tts.begin_utterance()
+            async for chunk in stream:
+                delta = chunk.choices[0].delta.content or ""
+                if not delta:
+                    continue
+                full_response += delta
+                sentence_buf  += delta
+
+                parts = _SENTENCE_END.split(sentence_buf)
+                if len(parts) > 1:
+                    for sentence in parts[:-1]:
+                        sentence = sentence.strip()
+                        if sentence:
+                            tts_pending += (" " if tts_pending else "") + sentence
+                    sentence_buf = parts[-1]
+
+                    if len(tts_pending.split()) >= TTS_MIN_WORDS:
+                        async for pcm in self.tts.synthesize(tts_pending):
+                            all_pcm.extend(pcm)
+                        tts_pending = ""
+
+            final_text = " ".join(filter(None, [tts_pending, sentence_buf.strip()]))
+            if final_text:
+                async for pcm in self.tts.synthesize(final_text):
+                    all_pcm.extend(pcm)
+            self.tts.end_utterance()
+
+            # Append tail silence so the mouth eases to rest
+            tail_samples = SAMPLE_RATE * TTS_TAIL_SILENCE_MS // 1000
+            all_pcm.extend(bytes(tail_samples * 2))
+
+            if not all_pcm:
+                return
+
+            # ── Step 2: encode full audio once, split into chunks ─────────────
+            speech_array = np.frombuffer(all_pcm, dtype=np.int16).astype(np.float32) / 32768.0
+
+            # Pad so length is an exact multiple of slice_samples
+            remainder = len(speech_array) % self.slice_samples
+            if remainder:
+                speech_array = np.concatenate(
+                    [speech_array, np.zeros(self.slice_samples - remainder, dtype=np.float32)]
+                )
+
+            logger.info(
+                f"[NONSTREAM] TTS done — {len(speech_array)/self.sr:.2f}s audio, "
+                f"running full-shot inference…"
+            )
+
+            def _infer_all():
+                torch.cuda.synchronize()
+                audio_emb_all = get_audio_embedding(self.model_pipeline, speech_array)
+
+                n_chunks = (audio_emb_all.shape[1] - self.frame_num) // self.slice_len
+                frames_out = []   # list of (H,W,3) uint8 numpy arrays
+                audio_out  = []   # matching PCM bytes per frame
+
+                # PCM bytes per video frame (slice covers slice_len frames)
+                bytes_per_slice = self.slice_samples * 2
+                bpf = bytes_per_slice // self.slice_len
+
+                for i in range(n_chunks):
+                    emb_chunk = audio_emb_all[
+                        :, i * self.slice_len : i * self.slice_len + self.frame_num
+                    ].contiguous()
+                    emb_chunk = emb_chunk * ANIMATION_MULTIPLIER
+
+                    video = run_pipeline(self.model_pipeline, emb_chunk)
+
+                    # first chunk keeps all frames; subsequent chunks skip motion frames
+                    if i != 0:
+                        video = video[self.motion_frames_num:]
+
+                    video_np = video.cpu().numpy()
+                    pcm_slice = bytes(all_pcm[i * bytes_per_slice : (i + 1) * bytes_per_slice])
+
+                    n_f = video_np.shape[0]
+                    for j in range(n_f):
+                        vf = video_np[j]
+                        if vf.ndim == 3 and vf.shape[0] == 3:
+                            vf = np.transpose(vf, (1, 2, 0))
+                        elif vf.ndim == 2:
+                            vf = np.stack([vf] * 3, axis=-1)
+                        if vf.dtype != np.uint8:
+                            vf = np.clip(vf, 0, 255).astype(np.uint8)
+                        if vf.shape[:2] != (512, 512):
+                            vf = cv2.resize(vf, (512, 512))
+                        frames_out.append(vf)
+                        audio_out.append(pcm_slice[j * bpf : (j + 1) * bpf])
+
+                torch.cuda.synchronize()
+                return frames_out, audio_out
+
+            frames, audio_slices = await asyncio.to_thread(_infer_all)
+            logger.info(f"[NONSTREAM] Inference done — {len(frames)} frames, pushing to playback…")
+
+            # ── Step 3: flood playback queue ──────────────────────────────────
+            for vf, audio_slice in zip(frames, audio_slices):
+                rgba = cv2.cvtColor(vf, cv2.COLOR_RGB2RGBA) if vf.shape[2] == 3 else vf
+                self.playback_queue.append((rgba, audio_slice))
+
+                if self.is_testing_mode and self._test_writer is not None:
+                    self._test_writer.write(cv2.cvtColor(vf, cv2.COLOR_RGB2BGR))
+                    if self._test_audio_writer is not None and audio_slice:
+                        self._test_audio_writer.writeframes(audio_slice)
+
+        except Exception as e:
+            logger.error(f"[NONSTREAM] Error: {e}")
+        finally:
+            self.conversation.append({"role": "assistant", "content": full_response})
+            logger.info(f"Assistant: {full_response!r}")
+
+            logger.debug("Waiting for playback queue to drain…")
+            while self.playback_queue:
+                await asyncio.sleep(0.05)
+
+            if self.is_testing_mode and self._test_writer is not None:
+                self._test_writer.release()
+                self._test_writer = None
+                if self._test_audio_writer is not None:
+                    self._test_audio_writer.close()
+                    self._test_audio_writer = None
+                logger.info(f"[TEST] Saved: {self._test_writer_path!r} + {self._test_audio_path!r}")
+
+            self._bot_speaking = False
+            logger.info("[NONSTREAM] Bot finished speaking — ready for next user input.")
+
+    # ──────────────────────────────────────────────────────────────────────────
     # LLM + TTS — called once a final transcript arrives
     # ──────────────────────────────────────────────────────────────────────────
     async def _respond(self, transcript: str):
@@ -668,17 +1151,35 @@ class AvatarBot:
         logger.info(f"User: {transcript!r}")
         self._bot_speaking = True
 
+        if self.is_testing_mode:
+            _uid = str(uuid.uuid4())
+            self._test_writer_path = os.path.join("debug_frames", f"{_uid}.mp4")
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            self._test_writer = cv2.VideoWriter(
+                self._test_writer_path, fourcc, float(self.tgt_fps), (512, 512)
+            )
+            self._test_audio_path = os.path.join("debug_frames", f"{_uid}.wav")
+            _wf = wave.open(self._test_audio_path, "wb")
+            _wf.setnchannels(1)
+            _wf.setsampwidth(2)          # S16LE = 2 bytes per sample
+            _wf.setframerate(self.sr)
+            self._test_audio_writer = _wf
+            logger.info(f"[TEST] Recording to {self._test_writer_path!r} + {self._test_audio_path!r}")
+
         self.conversation.append({"role": "user", "content": transcript})
 
         full_response = ""
-        sentence_buf  = ""
+        sentence_buf  = ""   # partial (mid-sentence) text from the LLM stream
+        tts_pending   = ""   # complete sentences held until we reach TTS_MIN_WORDS
         tts_audio_buf: bytearray = bytearray()
         float_buf:     list      = []
+
+        self.tts.begin_utterance()
 
         try:
             stream = await self.openai.chat.completions.create(
                 model="gpt-4o-mini",
-                messages=[{"role": "system", "content": SYSTEM_PROMPT}] + self.conversation,
+                messages=[{"role": "system", "content": self.system_prompt}] + self.conversation,
                 stream=True,
                 temperature=0.7,
             )
@@ -691,24 +1192,38 @@ class AvatarBot:
                 sentence_buf  += delta
                 logger.debug(f"LLM token: {delta!r}")
 
+                # Split on sentence-ending punctuation.
+                # parts[:-1] are complete sentences; parts[-1] is the in-progress fragment.
                 parts = _SENTENCE_END.split(sentence_buf)
                 if len(parts) > 1:
                     for sentence in parts[:-1]:
                         sentence = sentence.strip()
                         if sentence:
-                            logger.info(f"TTS sentence: {sentence!r}")
-                            async for pcm in self.tts.synthesize(sentence):
-                                await self._feed_tts_audio(tts_audio_buf, float_buf, pcm)
+                            tts_pending += (" " if tts_pending else "") + sentence
                     sentence_buf = parts[-1]
 
-            if sentence_buf.strip():
-                logger.info(f"TTS flush: {sentence_buf.strip()!r}")
-                async for pcm in self.tts.synthesize(sentence_buf.strip()):
+                    # Only dispatch to TTS once we have enough words.
+                    # This prevents single-word or tiny bursts from going to TTS
+                    # while the LLM is still generating.
+                    if len(tts_pending.split()) >= TTS_MIN_WORDS:
+                        logger.info(f"TTS dispatch ({len(tts_pending.split())} words): {tts_pending!r}")
+                        async for pcm in self.tts.synthesize(tts_pending):
+                            await self._feed_tts_audio(tts_audio_buf, float_buf, pcm)
+                        tts_pending = ""
+
+            # LLM stream finished — flush everything remaining unconditionally,
+            # regardless of word count.
+            final_text = " ".join(filter(None, [tts_pending, sentence_buf.strip()]))
+            if final_text:
+                logger.info(f"TTS end-of-stream flush: {final_text!r}")
+                async for pcm in self.tts.synthesize(final_text):
                     await self._feed_tts_audio(tts_audio_buf, float_buf, pcm)
 
         except Exception as e:
             logger.error(f"LLM/TTS error: {e}")
         finally:
+            self.tts.end_utterance()
+
             await self._flush_tts_audio(tts_audio_buf, float_buf)
 
             # Tail silence — 800 ms of zeros pushed through the same inference
@@ -723,9 +1238,19 @@ class AvatarBot:
             self.conversation.append({"role": "assistant", "content": full_response})
             logger.info(f"Assistant: {full_response!r}")
 
+            logger.debug("Waiting for inference queue to finish…")
+            await self.generation_queue.join()
             logger.debug("Waiting for playback queue to drain…")
-            while self.playback_queue or not self.generation_queue.empty():
-                await asyncio.sleep(0.1)
+            while self.playback_queue:
+                await asyncio.sleep(0.05)
+
+            if self.is_testing_mode and self._test_writer is not None:
+                self._test_writer.release()
+                self._test_writer = None
+                if self._test_audio_writer is not None:
+                    self._test_audio_writer.close()
+                    self._test_audio_writer = None
+                logger.info(f"[TEST] Saved: {self._test_writer_path!r} + {self._test_audio_path!r}")
 
             self._bot_speaking = False
             logger.info("Bot finished speaking — ready for next user input.")
@@ -791,7 +1316,8 @@ class AvatarBot:
                         transcript = await self.stt.transcribe_utterance(captured)
                         if transcript:
                             logger.info(f"Triggering LLM for: {transcript!r}")
-                            asyncio.create_task(self._respond(transcript))
+                            fn = self._respond if VIDEO_STREAM_GEN else self._respond_nonstream
+                            asyncio.create_task(fn(transcript))
                         else:
                             logger.warning("STT: no final transcript received")
 
@@ -801,9 +1327,8 @@ class AvatarBot:
     async def _greet(self):
         await asyncio.sleep(0.5)
         logger.info("Sending greeting…")
-        await self._respond(
-            "Greet the user warmly and briefly in English, then ask sarcastically(strictly no emojis)"
-        )
+        fn = self._respond if VIDEO_STREAM_GEN else self._respond_nonstream
+        await fn(self.greeting_text)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Main entry point
