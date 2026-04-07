@@ -163,3 +163,4 @@ xfuser==0.4.5
 yarl==1.23.0
 yunchang==0.6.4
 zipp==3.23.0
+torchaudio==2.11.0
